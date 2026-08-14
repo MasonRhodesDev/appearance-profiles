@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/MasonRhodesDev/appearance-profiles/main/schema/v1.json",
+  "title": "Appearance Profile v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version"],
+  "properties": {
+    "version": { "const": 1 },
+    "background": { "$ref": "#/$defs/background" },
+    "output": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/background" }
+    }
+  },
+  "$defs": {
+    "background": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "fit": { "enum": ["fill", "fit", "stretch", "center", "tile"] }
+      }
+    }
+  }
+}
+

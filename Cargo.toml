@@ -1,0 +1,13 @@
+[package]
+name = "appearance-profiles"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Neutral layered appearance profile standard and resolver"
+repository = "https://github.com/MasonRhodesDev/appearance-profiles"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.9"
+
