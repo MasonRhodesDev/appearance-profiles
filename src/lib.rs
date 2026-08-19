@@ -8,6 +8,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const PACKAGED_PROFILE: &str = "/usr/share/appearance-profiles/default.toml";
 pub const SYSTEM_PROFILE: &str = "/etc/appearance-profiles/default.toml";
 pub const PUBLISHED_ROOT: &str = "/var/lib/appearance-profiles/users";
+pub const BUNDLE_VERSION: u32 = 1;
+pub const BUNDLE_FILE: &str = "bundle.toml";
+const PIXEL_MAGIC: &[u8; 8] = b"APRGBA1\0";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -25,11 +28,18 @@ pub enum Error {
     Version(u32),
     #[error("invalid user name {0:?}")]
     User(String),
+    #[error("write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("invalid prepared appearance asset {path}: {message}")]
+    Asset { path: PathBuf, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Fit {
     #[default]
@@ -152,6 +162,185 @@ pub struct Registry {
     pub user: Option<Profile>,
 }
 
+/// Atomically published, producer-owned appearance bundle. LMTT is the
+/// producer; greeters, lockers, and shells are read-only consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PreparedBundle {
+    pub version: u32,
+    pub tokens: Option<PathBuf>,
+    pub backgrounds: Vec<PreparedBackground>,
+}
+
+impl Default for PreparedBundle {
+    fn default() -> Self {
+        Self {
+            version: BUNDLE_VERSION,
+            tokens: None,
+            backgrounds: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedBackground {
+    pub selectors: Vec<String>,
+    pub width: u32,
+    pub height: u32,
+    pub fit: Fit,
+    pub asset: PathBuf,
+}
+
+impl PreparedBundle {
+    pub fn load(path: &Path) -> Result<Option<Self>> {
+        let source = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(Error::Read {
+                    path: path.into(),
+                    source,
+                });
+            }
+        };
+        let mut bundle: Self = toml::from_str(&source).map_err(|source| Error::Parse {
+            path: path.into(),
+            source,
+        })?;
+        if bundle.version != BUNDLE_VERSION {
+            return Err(Error::Version(bundle.version));
+        }
+        let root = path.parent().unwrap_or_else(|| Path::new("."));
+        if let Some(tokens) = &bundle.tokens
+            && tokens.is_relative()
+        {
+            bundle.tokens = Some(root.join(tokens));
+        }
+        for background in &mut bundle.backgrounds {
+            if background.asset.is_relative() {
+                background.asset = root.join(&background.asset);
+            }
+        }
+        Ok(Some(bundle))
+    }
+
+    pub fn load_published(user: &str) -> Result<Option<Self>> {
+        Self::load(&published_bundle_path(user)?)
+    }
+
+    pub fn resolve(
+        &self,
+        output: &OutputIdentity,
+        width: u32,
+        height: u32,
+        fit: Fit,
+    ) -> Option<&PreparedBackground> {
+        let selectors: Vec<_> = output.selectors().collect();
+        self.backgrounds.iter().find(|background| {
+            background.width == width
+                && background.height == height
+                && background.fit == fit
+                && selectors
+                    .iter()
+                    .any(|selector| background.selectors.contains(selector))
+        })
+    }
+}
+
+pub fn read_prepared_pixels(background: &PreparedBackground) -> Result<Vec<u8>> {
+    let path = &background.asset;
+    let bytes = std::fs::read(path).map_err(|source| Error::Read {
+        path: path.clone(),
+        source,
+    })?;
+    let expected = background.width as usize * background.height as usize * 4;
+    if bytes.len() != PIXEL_MAGIC.len() + expected || !bytes.starts_with(PIXEL_MAGIC) {
+        return Err(Error::Asset {
+            path: path.clone(),
+            message: format!("expected {} RGBA bytes", expected),
+        });
+    }
+    Ok(bytes[PIXEL_MAGIC.len()..].to_vec())
+}
+
+pub fn write_prepared_pixels(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<()> {
+    let expected = width as usize * height as usize * 4;
+    if rgba.len() != expected {
+        return Err(Error::Asset {
+            path: path.into(),
+            message: format!("got {} bytes, expected {expected}", rgba.len()),
+        });
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| Error::Write {
+            path: parent.into(),
+            source,
+        })?;
+    }
+    let temporary = path.with_extension("rgba.tmp");
+    let mut bytes = Vec::with_capacity(PIXEL_MAGIC.len() + rgba.len());
+    bytes.extend_from_slice(PIXEL_MAGIC);
+    bytes.extend_from_slice(rgba);
+    std::fs::write(&temporary, bytes).map_err(|source| Error::Write {
+        path: temporary.clone(),
+        source,
+    })?;
+    std::fs::rename(&temporary, path).map_err(|source| Error::Write {
+        path: path.into(),
+        source,
+    })
+}
+
+#[cfg(feature = "builder")]
+pub fn prepare_background(path: &Path, fit: Fit, width: u32, height: u32) -> Result<Vec<u8>> {
+    use image::{RgbaImage, imageops};
+    let source = image::open(path).map_err(|error| Error::Asset {
+        path: path.into(),
+        message: error.to_string(),
+    })?;
+    let source = source.to_rgba8();
+    let (in_w, in_h) = source.dimensions();
+    let mut output = RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 255]));
+    let output = match fit {
+        Fit::Stretch => imageops::resize(&source, width, height, imageops::FilterType::Triangle),
+        Fit::Fill | Fit::Fit => {
+            let scale_w = width as f64 / in_w as f64;
+            let scale_h = height as f64 / in_h as f64;
+            let scale = if fit == Fit::Fill {
+                scale_w.max(scale_h)
+            } else {
+                scale_w.min(scale_h)
+            };
+            let resized = imageops::resize(
+                &source,
+                (in_w as f64 * scale).round().max(1.0) as u32,
+                (in_h as f64 * scale).round().max(1.0) as u32,
+                imageops::FilterType::Triangle,
+            );
+            let x = (i64::from(width) - i64::from(resized.width())).div_euclid(2);
+            let y = (i64::from(height) - i64::from(resized.height())).div_euclid(2);
+            imageops::overlay(&mut output, &resized, x, y);
+            output
+        }
+        Fit::Center => {
+            let x = (i64::from(width) - i64::from(in_w)).div_euclid(2);
+            let y = (i64::from(height) - i64::from(in_h)).div_euclid(2);
+            imageops::overlay(&mut output, &source, x, y);
+            output
+        }
+        Fit::Tile => {
+            for y in (0..height).step_by(in_h as usize) {
+                for x in (0..width).step_by(in_w as usize) {
+                    imageops::overlay(&mut output, &source, i64::from(x), i64::from(y));
+                }
+            }
+            output
+        }
+    };
+    Ok(output.into_raw())
+}
+
 impl Registry {
     pub fn load(user_path: Option<&Path>) -> Result<Self> {
         Ok(Self {
@@ -240,6 +429,13 @@ pub fn published_profile_path(user: &str) -> Result<PathBuf> {
     Ok(Path::new(PUBLISHED_ROOT).join(user).join("default.toml"))
 }
 
+pub fn published_bundle_path(user: &str) -> Result<PathBuf> {
+    Ok(published_profile_path(user)?
+        .parent()
+        .expect("published profile has a parent")
+        .join(BUNDLE_FILE))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,8 +449,10 @@ mod tests {
 
     #[test]
     fn resolution_is_fieldwise_and_layered() {
-        let mut packaged = Profile::default();
-        packaged.background = bg("/packaged", Some(Fit::Fit));
+        let packaged = Profile {
+            background: bg("/packaged", Some(Fit::Fit)),
+            ..Profile::default()
+        };
         let mut system = Profile::default();
         system.background.path = Some("/system".into());
         let mut user = Profile::default();
@@ -299,5 +497,40 @@ mod tests {
     fn user_name_is_safe_for_a_path_component() {
         assert!(published_profile_path("mason").is_ok());
         assert!(published_profile_path("../root").is_err());
+    }
+
+    #[test]
+    fn prepared_bundle_resolves_exact_output_geometry() {
+        let bundle = PreparedBundle {
+            backgrounds: vec![PreparedBackground {
+                selectors: vec!["DP-1".into(), "desc:Dell Panel".into()],
+                width: 3840,
+                height: 2160,
+                fit: Fit::Fill,
+                asset: "backgrounds/dell.rgba".into(),
+            }],
+            ..PreparedBundle::default()
+        };
+        let output = OutputIdentity::new("DP-1", Some("Dell Panel".into()));
+        assert!(bundle.resolve(&output, 3840, 2160, Fit::Fill).is_some());
+        assert!(bundle.resolve(&output, 1920, 1080, Fit::Fill).is_none());
+    }
+
+    #[test]
+    fn prepared_pixel_file_validates_size_and_magic() {
+        let root = std::env::temp_dir().join(format!("appearance-assets-{}", std::process::id()));
+        let path = root.join("test.rgba");
+        let pixels = vec![7; 4 * 3 * 2];
+        write_prepared_pixels(&path, &pixels, 3, 2).unwrap();
+        let background = PreparedBackground {
+            selectors: vec!["DP-1".into()],
+            width: 3,
+            height: 2,
+            fit: Fit::Fill,
+            asset: path.clone(),
+        };
+        assert_eq!(read_prepared_pixels(&background).unwrap(), pixels);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 }

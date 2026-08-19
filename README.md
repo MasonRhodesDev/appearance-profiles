@@ -54,3 +54,32 @@ policy; malformed present layers are diagnostics, not silent defaults.
 The Rust crate implements the normative merge and resolution algorithm.
 `schema/v1.json` is the language-neutral validation contract.
 
+## Prepared bundle service boundary
+
+LMTT is the sole producer and lifecycle owner of prepared appearance bundles.
+Greeters, lockers, compositors, and other UI processes are read-only consumers.
+They must never require LMTT or a cache daemon to be running.
+
+The producer atomically publishes `bundle.toml`, `tokens.json`, copied source
+assets, and monitor-sized RGBA assets beneath:
+
+```text
+/var/lib/appearance-profiles/users/USER/
+```
+
+`bundle.toml` is versioned independently from the preference schema. Prepared
+backgrounds are keyed by output selectors, pixel dimensions, and fit mode.
+Consumers use an exact prepared match when available and retain a non-blocking
+runtime fallback for cache misses, new monitor modes, or damaged assets.
+
+Responsibilities are deliberately one-way:
+
+| LMTT producer | Read-only consumers |
+|---|---|
+| Resolve and copy private source assets | Resolve the active profile |
+| Decode, crop, scale, and encode prepared assets | Load an exact prepared asset |
+| Publish tokens and manifests atomically | Fall back asynchronously on a miss |
+| Version, invalidate, and garbage-collect generations | Never mutate the published bundle |
+
+An optional cache warmer may call the same producer library, but it is not a
+service dependency and must not sit on the login or lock critical path.

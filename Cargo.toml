@@ -1,6 +1,6 @@
 [package]
 name = "appearance-profiles"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Neutral layered appearance profile standard and resolver"
@@ -10,4 +10,8 @@ repository = "https://github.com/MasonRhodesDev/appearance-profiles"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "0.9"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 
+[features]
+default = []
+builder = ["dep:image"]
