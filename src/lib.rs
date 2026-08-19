@@ -11,6 +11,7 @@ pub const PUBLISHED_ROOT: &str = "/var/lib/appearance-profiles/users";
 pub const BUNDLE_VERSION: u32 = 1;
 pub const BUNDLE_FILE: &str = "bundle.toml";
 const PIXEL_MAGIC: &[u8; 8] = b"APRGBA1\0";
+const XRGB_MAGIC: &[u8; 8] = b"APXRGB1\0";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -189,7 +190,25 @@ pub struct PreparedBackground {
     pub width: u32,
     pub height: u32,
     pub fit: Fit,
+    #[serde(default)]
+    pub format: PixelFormat,
     pub asset: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PixelFormat {
+    #[default]
+    Rgba8,
+    Xrgb8888Le,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedPixels {
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
 }
 
 impl PreparedBundle {
@@ -248,20 +267,86 @@ impl PreparedBundle {
     }
 }
 
-pub fn read_prepared_pixels(background: &PreparedBackground) -> Result<Vec<u8>> {
+pub fn read_prepared_asset(background: &PreparedBackground) -> Result<PreparedPixels> {
     let path = &background.asset;
     let bytes = std::fs::read(path).map_err(|source| Error::Read {
         path: path.clone(),
         source,
     })?;
     let expected = background.width as usize * background.height as usize * 4;
-    if bytes.len() != PIXEL_MAGIC.len() + expected || !bytes.starts_with(PIXEL_MAGIC) {
+    let magic = match background.format {
+        PixelFormat::Rgba8 => PIXEL_MAGIC,
+        PixelFormat::Xrgb8888Le => XRGB_MAGIC,
+    };
+    if bytes.len() != magic.len() + expected || !bytes.starts_with(magic) {
         return Err(Error::Asset {
             path: path.clone(),
             message: format!("expected {} RGBA bytes", expected),
         });
     }
-    Ok(bytes[PIXEL_MAGIC.len()..].to_vec())
+    Ok(PreparedPixels {
+        bytes: bytes[magic.len()..].to_vec(),
+        width: background.width,
+        height: background.height,
+        format: background.format,
+    })
+}
+
+pub fn read_prepared_pixels(background: &PreparedBackground) -> Result<Vec<u8>> {
+    let prepared = read_prepared_asset(background)?;
+    if prepared.format != PixelFormat::Rgba8 {
+        return Err(Error::Asset {
+            path: background.asset.clone(),
+            message: "asset is not RGBA8".into(),
+        });
+    }
+    Ok(prepared.bytes)
+}
+
+pub fn write_prepared_xrgb(path: &Path, xrgb: &[u8], width: u32, height: u32) -> Result<()> {
+    write_prepared_bytes(path, xrgb, width, height, XRGB_MAGIC)
+}
+
+fn write_prepared_bytes(
+    path: &Path,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    magic: &[u8; 8],
+) -> Result<()> {
+    let expected = width as usize * height as usize * 4;
+    if pixels.len() != expected {
+        return Err(Error::Asset {
+            path: path.into(),
+            message: format!("got {} bytes, expected {expected}", pixels.len()),
+        });
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| Error::Write {
+            path: parent.into(),
+            source,
+        })?;
+    }
+    let temporary = path.with_extension("pixels.tmp");
+    let mut bytes = Vec::with_capacity(magic.len() + pixels.len());
+    bytes.extend_from_slice(magic);
+    bytes.extend_from_slice(pixels);
+    std::fs::write(&temporary, bytes).map_err(|source| Error::Write {
+        path: temporary.clone(),
+        source,
+    })?;
+    std::fs::rename(&temporary, path).map_err(|source| Error::Write {
+        path: path.into(),
+        source,
+    })
+}
+
+pub fn rgba_to_xrgb8888_le(rgba: &[u8]) -> Vec<u8> {
+    let mut xrgb = Vec::with_capacity(rgba.len());
+    for pixel in rgba.chunks_exact(4) {
+        xrgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 0]);
+    }
+    xrgb
 }
 
 pub fn write_prepared_pixels(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<()> {
@@ -507,6 +592,7 @@ mod tests {
                 width: 3840,
                 height: 2160,
                 fit: Fit::Fill,
+                format: PixelFormat::Rgba8,
                 asset: "backgrounds/dell.rgba".into(),
             }],
             ..PreparedBundle::default()
@@ -527,9 +613,30 @@ mod tests {
             width: 3,
             height: 2,
             fit: Fit::Fill,
+            format: PixelFormat::Rgba8,
             asset: path.clone(),
         };
         assert_eq!(read_prepared_pixels(&background).unwrap(), pixels);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn xrgb_asset_round_trips_and_converts_channel_order() {
+        let root = std::env::temp_dir().join(format!("appearance-xrgb-{}", std::process::id()));
+        let path = root.join("test.xrgb");
+        let xrgb = rgba_to_xrgb8888_le(&[0x11, 0x22, 0x33, 0xff]);
+        assert_eq!(xrgb, [0x33, 0x22, 0x11, 0]);
+        write_prepared_xrgb(&path, &xrgb, 1, 1).unwrap();
+        let background = PreparedBackground {
+            selectors: vec!["DP-1".into()],
+            width: 1,
+            height: 1,
+            fit: Fit::Fill,
+            format: PixelFormat::Xrgb8888Le,
+            asset: path.clone(),
+        };
+        assert_eq!(read_prepared_asset(&background).unwrap().bytes, xrgb);
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(root).unwrap();
     }

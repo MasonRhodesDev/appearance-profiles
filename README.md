@@ -69,6 +69,9 @@ assets, and monitor-sized RGBA assets beneath:
 
 `bundle.toml` is versioned independently from the preference schema. Prepared
 backgrounds are keyed by output selectors, pixel dimensions, and fit mode.
+The preferred cache format is `xrgb8888-le`: four bytes per pixel in native
+little-endian XRGB8888 memory order (`B, G, R, unused`), allowing software
+scanout backends to copy the prepared frame without image decoding or scaling.
 Consumers use an exact prepared match when available and retain a non-blocking
 runtime fallback for cache misses, new monitor modes, or damaged assets.
 
