@@ -25,6 +25,11 @@ pub enum Error {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("serialize {path}: {source}")]
+    Serialize {
+        path: PathBuf,
+        source: toml::ser::Error,
+    },
     #[error("appearance profile version {0} is unsupported")]
     Version(u32),
     #[error("invalid user name {0:?}")]
@@ -246,6 +251,38 @@ impl PreparedBundle {
 
     pub fn load_published(user: &str) -> Result<Option<Self>> {
         Self::load(&published_bundle_path(user)?)
+    }
+
+    /// Atomically publish a completed bundle for one user.
+    pub fn publish(&self, user: &str) -> Result<PathBuf> {
+        let destination = published_bundle_path(user)?;
+        self.publish_to(&destination)?;
+        Ok(destination)
+    }
+
+    /// Atomically publish to an explicit destination (primarily for builders
+    /// and tests). Readers observe either the previous complete bundle or the
+    /// new complete bundle, never a partial TOML document.
+    pub fn publish_to(&self, destination: &Path) -> Result<()> {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| Error::Write {
+                path: parent.into(),
+                source,
+            })?;
+        }
+        let source = toml::to_string_pretty(self).map_err(|source| Error::Serialize {
+            path: destination.into(),
+            source,
+        })?;
+        let temporary = destination.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&temporary, source).map_err(|source| Error::Write {
+            path: temporary.clone(),
+            source,
+        })?;
+        std::fs::rename(&temporary, destination).map_err(|source| Error::Write {
+            path: destination.into(),
+            source,
+        })
     }
 
     pub fn resolve(
@@ -600,6 +637,22 @@ mod tests {
         let output = OutputIdentity::new("DP-1", Some("Dell Panel".into()));
         assert!(bundle.resolve(&output, 3840, 2160, Fit::Fill).is_some());
         assert!(bundle.resolve(&output, 1920, 1080, Fit::Fill).is_none());
+    }
+
+    #[test]
+    fn prepared_bundle_publishes_atomically_and_loads() {
+        let root = std::env::temp_dir().join(format!("appearance-bundle-{}", std::process::id()));
+        let path = root.join("bundle.toml");
+        let bundle = PreparedBundle::default();
+        bundle.publish_to(&path).unwrap();
+        assert_eq!(PreparedBundle::load(&path).unwrap(), Some(bundle));
+        assert!(
+            !path
+                .with_extension(format!("tmp-{}", std::process::id()))
+                .exists()
+        );
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[test]
